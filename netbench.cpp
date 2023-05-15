@@ -234,9 +234,6 @@ std::pair<struct io_uring, IoUringRxConfig> mkIoUring(
         "io_uring_queue_init_params");
   }
 
-  if (rx_cfg.register_ring) {
-    checkedErrno(io_uring_register_ring_fd(&ring), "register ring fd");
-  }
   auto ret_cfg = rx_cfg;
   if (params.features & IORING_FEAT_CQE_SKIP) {
     ret_cfg.cqe_skip_success_flag = IOSQE_CQE_SKIP_SUCCESS;
@@ -1380,7 +1377,6 @@ struct IOUringRunner : public RunnerBase {
   }
 
   void start() override {
-    io_uring_enable_rings(&ring);
   }
 
   void loop(std::atomic<bool>* should_shutdown) override {
@@ -1390,6 +1386,7 @@ struct IOUringRunner : public RunnerBase {
     timeout.tv_nsec = 0;
 
     if (rxCfg_.register_ring) {
+      io_uring_enable_rings(&ring);
       io_uring_register_ring_fd(&ring);
     }
 
