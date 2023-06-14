@@ -1386,7 +1386,6 @@ struct IOUringRunner : public RunnerBase {
     timeout.tv_nsec = 0;
 
     if (rxCfg_.register_ring) {
-      io_uring_enable_rings(&ring);
       io_uring_register_ring_fd(&ring);
     }
 
