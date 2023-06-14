@@ -11,6 +11,7 @@
 #include <liburing.h>
 #include <unistd.h>
 
+#include <net/if.h>
 #include <netinet/in.h>
 #include <stdlib.h>
 #include <sys/epoll.h>
@@ -114,6 +115,12 @@ struct IoUringRxConfig : RxConfig {
   bool huge_pages = false;
   int multishot_recv = 1;
   bool defer_taskrun = false;
+  bool use_zc = false;
+  int zc_pool_pages = 4096;
+  int zc_pool_page_size = 4096;
+  unsigned zc_queue_id = 0;
+  std::string zc_ifname;
+  unsigned zc_ifindex;
 
   // not for actual user updating, but dependent on the kernel:
   unsigned int cqe_skip_success_flag = 0;
@@ -156,7 +163,15 @@ struct IoUringRxConfig : RxConfig {
             : strcat(" defer_taskrun=", defer_taskrun),
         is_default(&IoUringRxConfig::multishot_recv)
             ? ""
-            : strcat(" multishot_recv=", multishot_recv));
+            : strcat(" multishot_recv=", multishot_recv),
+        is_default(&IoUringRxConfig::use_zc) ? "" : strcat(" use_zc=", use_zc),
+        is_default(&IoUringRxConfig::zc_pool_pages)
+            ? ""
+            : strcat(" zc_pool_pages=", zc_pool_pages),
+        is_default(&IoUringRxConfig::zc_pool_page_size)
+            ? ""
+            : strcat(" zc_pool_page_size=", zc_pool_page_size),
+        strcat(" zc_ifname=", zc_ifname));
   }
 };
 
@@ -217,6 +232,7 @@ std::pair<struct io_uring, IoUringRxConfig> mkIoUring(
 
   params.flags = newer_flags;
   params.flags |= IORING_SETUP_CQSIZE;
+  params.flags |= IORING_SETUP_CQE32;
 
   if (rx_cfg.defer_taskrun) {
     params.flags |= IORING_SETUP_DEFER_TASKRUN;
@@ -224,14 +240,19 @@ std::pair<struct io_uring, IoUringRxConfig> mkIoUring(
     params.flags |= IORING_SETUP_R_DISABLED;
   }
 
+  if (rx_cfg.use_zc) {
+    params.flags |= IORING_SETUP_DEFER_TASKRUN;
+    params.flags |= IORING_SETUP_SINGLE_ISSUER;
+    params.flags |= IORING_SETUP_R_DISABLED;
+  }
+
+  // NOTE: cqe_count = QD * 8 = 64 * 8 = 512
   params.cq_entries = cqe_count;
+  // NOTE: sqe_count = QD = 64
   int ret = io_uring_queue_init_params(rx_cfg.sqe_count, &ring, &params);
   if (ret < 0) {
-    log("trying init again without COOP_TASKRUN or SUBMIT_ALL");
-    params.flags = params.flags & (~newer_flags);
-    checkedErrno(
-        io_uring_queue_init_params(rx_cfg.sqe_count, &ring, &params),
-        "io_uring_queue_init_params");
+    // WARN: SUBMIT_ALL and COOP_TASKRUN are both required
+    throw std::runtime_error("failed to init ring");
   }
 
   auto ret_cfg = rx_cfg;
@@ -845,6 +866,127 @@ class BufferProviderV2 : private boost::noncopyable {
   std::array<uint16_t, 32> indices;
 };
 
+class ZCPoolProvider : private boost::noncopyable {
+ public:
+  explicit ZCPoolProvider(IoUringRxConfig const& rx_cfg)
+      : rxCfg_(rx_cfg),
+        pages_(rx_cfg.zc_pool_pages),
+        pageSize_(rx_cfg.zc_pool_page_size),
+        poolSize_(pages_ * pageSize_) {
+    poolBase_ = mmap(
+        NULL,
+        poolSize_,
+        PROT_READ | PROT_WRITE,
+        MAP_ANONYMOUS | MAP_PRIVATE,
+        0,
+        0);
+    if (poolBase_ == MAP_FAILED) {
+      auto errnoCopy = errno;
+      die("unable to allocate pages of size ",
+          poolSize_,
+          ": ",
+          strerror(errnoCopy));
+    }
+  }
+
+  ~ZCPoolProvider() {
+    munmap(poolBase_, poolSize_);
+  }
+
+  void initialRegister(struct io_uring* ring) {
+    struct io_uring_zcrx_area_reg area_reg = {
+        .addr = (__u64)(unsigned long)poolBase_,
+        .len = poolSize_,
+        .flags = 0,
+        .area_id = 0,
+    };
+
+    struct io_uring_zcrx_ifq_reg reg = {
+        .if_idx = rxCfg_.zc_ifindex,
+        .if_rxq = rxCfg_.zc_queue_id,
+        .rq_entries = 4096,
+        .area_ptr = (__u64)(unsigned long)&area_reg,
+    };
+
+    checkedErrno(io_uring_register_ifq(ring, &reg), "register zc ifq");
+
+    ringPtr_ = mmap(
+        0,
+        reg.offsets.mmap_sz,
+        PROT_READ | PROT_WRITE,
+        MAP_SHARED | MAP_POPULATE,
+        ring->enter_ring_fd,
+        IORING_OFF_RQ_RING);
+    if (ringPtr_ == MAP_FAILED) {
+      auto errnoCopy = errno;
+      die("unable to map io_uring rbuf rings: ", strerror(errnoCopy));
+    }
+    ringSz_ = reg.offsets.mmap_sz;
+
+    rqRing_.khead = (unsigned int*)((char*)ringPtr_ + reg.offsets.head);
+    rqRing_.ktail = (unsigned int*)((char*)ringPtr_ + reg.offsets.tail);
+    rqRing_.rqes =
+        (struct io_uring_zcrx_rqe*)((char*)ringPtr_ + reg.offsets.rqes);
+    rqRing_.rq_tail = 0;
+    rqRing_.ring_entries = reg.rq_entries;
+  }
+
+  void sync() {
+    IO_URING_WRITE_ONCE(*rqRing_.ktail, rqRing_.rq_tail);
+  }
+
+ private:
+ public:
+  ConsumeResults consume(
+      struct io_uring_cqe* cqe,
+      struct io_uring_zcrx_cqe* rcqe) {
+    uint64_t mask = (1ULL << IORING_ZCRX_AREA_SHIFT) - 1;
+    uint64_t off = rcqe->off & mask;
+    void* addr = (char*)poolBase_ + off;
+    auto consumed = parser_.consume((const char*)addr, cqe->res);
+    vlog(
+        "size=",
+        cqe->res,
+        ", to_write=",
+        consumed.to_write,
+        ", count=",
+        consumed.count,
+        ", off=",
+        rcqe->off);
+    bytesReceived_ += cqe->res;
+    return consumed;
+  }
+
+  void recycle(struct io_uring_cqe* cqe, struct io_uring_zcrx_cqe* rcqe) {
+    // TODO: check rq ring is not full
+    struct io_uring_zcrx_rqe* rqe;
+    unsigned mask = rqRing_.ring_entries - 1;
+    rqe = &rqRing_.rqes[(rqRing_.rq_tail & mask)];
+    rqe->off = rcqe->off;
+    rqe->len = cqe->res;
+    rqRing_.rq_tail++;
+  }
+
+ private:
+  IoUringRxConfig rxCfg_;
+  size_t pages_;
+  size_t pageSize_;
+  size_t poolSize_ = 0;
+  void* poolBase_;
+
+  void* ringPtr_;
+  size_t ringSz_;
+  struct io_uring_zcrx_rq rqRing_;
+
+  unsigned count_ = 0;
+  unsigned cachedCqTail_ = 0;
+  unsigned sockIdx_ = 0;
+  int consumed_ = 0;
+
+  size_t bytesReceived_ = 0;
+  ProtocolParser parser_;
+};
+
 static constexpr int kUseBufferProviderFlag = 1;
 static constexpr int kUseBufferProviderV2Flag = 2;
 
@@ -868,11 +1010,15 @@ struct BasicSock {
       BufferProviderV1>;
 
   bool isFixedFiles() const {
-    return cfg_.fixed_files;
+    return cfg_.fixed_files && !cfg_.use_zc;
   }
 
   bool isMultiShotRecv() const {
     return cfg_.multishot_recv;
+  }
+
+  bool isZeroCopy() const {
+    return cfg_.use_zc;
   }
 
   explicit BasicSock(IoUringRxConfig const& cfg, int fd) : cfg_(cfg), fd_(fd) {
@@ -909,6 +1055,7 @@ struct BasicSock {
   }
 
   void addSend(struct io_uring_sqe* sqe, unsigned char* b, uint32_t len) {
+    vlog("fd=", fd_, ", len=", len);
     io_uring_prep_send(sqe, fd_, b, len, MSG_WAITALL);
     if (isFixedFiles()) {
       sqe->flags |= IOSQE_FIXED_FILE;
@@ -917,32 +1064,44 @@ struct BasicSock {
   }
 
   void addRead(struct io_uring_sqe* sqe, TBufferProvider& provider) {
+    vlog("start, fd=", fd_);
     if (kUseBufferProviderVersion) {
       size_t const size = isMultiShotRecv() ? 0LLU : provider.sizePerBuffer();
 
       if (cfg_.recvmsg) {
+        vlog("use buf provider, recvmsg");
         io_uring_prep_recvmsg(sqe, fd_, &recvmsgHdr_, 0);
         if (isMultiShotRecv()) {
           sqe->ioprio |= IORING_RECV_MULTISHOT;
         }
       } else {
         if (isMultiShotRecv()) {
+          vlog("use buf provider, recv_multishot");
           io_uring_prep_recv_multishot(sqe, fd_, NULL, size, 0);
         } else {
+          vlog("use buf provider, recv");
           io_uring_prep_recv(sqe, fd_, NULL, size, 0);
         }
       }
       sqe->flags |= IOSQE_BUFFER_SELECT;
       sqe->buf_group = TBufferProvider::kBgid;
     } else if (cfg_.recvmsg) {
+      vlog("recvmsg");
       io_uring_prep_recvmsg(sqe, fd_, &recvmsgHdr_, 0);
     } else {
+      vlog("recv");
       io_uring_prep_recv(sqe, fd_, &buff[0], sizeof(buff), 0);
     }
 
     if (isFixedFiles()) {
       sqe->flags |= IOSQE_FIXED_FILE;
     }
+  }
+
+  void addRecvZc(struct io_uring_sqe* sqe) {
+    vlog("start, fd=", fd_);
+    io_uring_prep_rw(IORING_OP_RECV_ZC, sqe, fd_, NULL, 0, 0);
+    sqe->ioprio |= IORING_RECV_MULTISHOT;
   }
 
   bool closing() const {
@@ -1008,6 +1167,13 @@ struct BasicSock {
   void didRead(char const* b, size_t n) {
     auto consumed = parser.consume(b, n);
     runWorkload(cfg_, consumed.count);
+    vlog(
+        "size=",
+        n,
+        ", to_write=",
+        consumed.to_write,
+        ", count=",
+        consumed.count);
     do_send += consumed;
   }
 
@@ -1069,6 +1235,11 @@ struct IOUringRunner : public RunnerBase {
       for (int i = rx_cfg.fixed_file_count - 1; i >= 0; i--)
         acceptFdPool_.push_back(i);
     }
+
+    if (isZeroCopy()) {
+      zcPool_.emplace(rxCfg_);
+      zcPool_->initialRegister(&ring);
+    }
   }
 
   ~IOUringRunner() {
@@ -1104,6 +1275,7 @@ struct IOUringRunner : public RunnerBase {
   static constexpr int kAccept = 1;
   static constexpr int kRead = 2;
   static constexpr int kWrite = 3;
+  static constexpr int kRecvZc = 4;
   static constexpr int kOther = 0;
 
   void addListenSock(int fd, bool v6) override {
@@ -1113,6 +1285,7 @@ struct IOUringRunner : public RunnerBase {
   }
 
   void addAccept(ListenSock* ls) {
+    vlog("start, fd=", ls->fd);
     struct io_uring_sqe* sqe = get_sqe();
     struct sockaddr* addr;
     if (ls->isv6) {
@@ -1127,9 +1300,18 @@ struct IOUringRunner : public RunnerBase {
         die("only allowed one accept at a time");
       }
       ls->nextAcceptIdx = nextFdIdx();
+      vlog(
+          "prep accept direct, client_len=",
+          ls->client_len,
+          ", next_accept_idx=",
+          ls->nextAcceptIdx);
       io_uring_prep_accept_direct(
           sqe, ls->fd, addr, &ls->client_len, SOCK_NONBLOCK, ls->nextAcceptIdx);
+    } else if (isZeroCopy()) {
+      vlog("prep accept ZC");
+      io_uring_prep_accept(sqe, ls->fd, NULL, NULL, 0);
     } else {
+      vlog("prep accept, client_len=", ls->client_len);
       io_uring_prep_accept(sqe, ls->fd, addr, &ls->client_len, SOCK_NONBLOCK);
     }
     io_uring_sqe_set_data(sqe, tag(ls, kAccept));
@@ -1154,6 +1336,12 @@ struct IOUringRunner : public RunnerBase {
     io_uring_sqe_set_data(sqe, tag(sock, kRead));
   }
 
+  void addRecvZc(TSock* sock) {
+    struct io_uring_sqe* sqe = get_sqe();
+    sock->addRecvZc(sqe);
+    io_uring_sqe_set_data(sqe, tag(sock, kRecvZc));
+  }
+
   void addSend(TSock* sock, uint32_t len) {
     if (unlikely(sendBuff_.size() < len)) {
       sendBuff_.resize(len);
@@ -1165,6 +1353,7 @@ struct IOUringRunner : public RunnerBase {
 
   void processAccept(struct io_uring_cqe* cqe) {
     int fd = cqe->res;
+    vlog("start");
     ListenSock* ls = untag<ListenSock>(cqe->user_data);
     if (fd >= 0) {
       int used_fd = fd;
@@ -1179,8 +1368,21 @@ struct IOUringRunner : public RunnerBase {
         used_fd = ls->nextAcceptIdx;
         ls->nextAcceptIdx = -1;
       }
+      // TODO: For ZC, check IORING_CQE_F_NOTIF is not set in flags
+      // Then get the clientfd from cqe->res
+      /*
+      if (isZeroCopy()) {
+        log("----- registering fd=", used_fd, " using io_uring_register_files");
+        io_uring_register_files(&ring, &used_fd, 1);
+      }
+      */
+      vlog("creating new sock with fd=", used_fd);
       TSock* sock = new TSock(rxCfg_, used_fd);
-      addRead(sock);
+      if (isZeroCopy()) {
+        addRecvZc(sock);
+      } else {
+        addRead(sock);
+      }
       newSock();
     } else if (!stopping) {
       die("unexpected accept result ",
@@ -1218,6 +1420,7 @@ struct IOUringRunner : public RunnerBase {
   }
 
   void processClose(struct io_uring_cqe* cqe, TSock* sock) {
+    vlog("start");
     int res = cqe->res;
     if (!res || res == -EBADF) {
       if (isFixedFiles()) {
@@ -1232,6 +1435,7 @@ struct IOUringRunner : public RunnerBase {
   }
 
   void processRead(struct io_uring_cqe* cqe) {
+    vlog("start");
     TSock* sock = untag<TSock>(cqe->user_data);
     auto res = sock->didRead(buffers_, cqe);
 
@@ -1248,6 +1452,7 @@ struct IOUringRunner : public RunnerBase {
       }
       didRead(res.amount);
       if (!sock->isMultiShotRecv() || !(cqe->flags & IORING_CQE_F_MORE)) {
+        vlog("!IORING_CQE_F_MORE, add another read");
         addRead(sock);
       }
     } else if (res.amount <= 0) {
@@ -1284,6 +1489,55 @@ struct IOUringRunner : public RunnerBase {
     }
   }
 
+  void processRecvZc(struct io_uring_cqe* cqe) {
+    TSock* sock = untag<TSock>(cqe->user_data);
+    vlog("start");
+    if (!cqe->user_data && !cqe->flags) {
+      die("bad cqe");
+    }
+
+    if (cqe->res == 0 && cqe->flags == 0) {
+      vlog("EOF, flags=", cqe->flags, ", res=", cqe->res, ", sock=", sock);
+      sock->doClose();
+      delete sock;
+      delSock();
+      return;
+    }
+
+    if (cqe->res == -ENOBUFS) {
+      vlog("ENOBUFS, closing socket and deleting it");
+      sock->doClose();
+      delete sock;
+      delSock();
+      return;
+    }
+
+    if (!(cqe->flags & IORING_CQE_F_MORE)) {
+      vlog("!IORING_CQE_F_MORE, add another recvzc");
+      addRecvZc(sock);
+    }
+
+    if (cqe->res < 0) {
+      die("recvzc cqe res=", -cqe->res, ", err=", strerror(-cqe->res));
+      if (cqe->res == -EFAULT || cqe->res == -EINVAL)
+        die("NB: This requires a kernel version >= 6.0");
+    }
+
+    // completion must tell us which ifq to look in
+    // struct io_uring_rbuf_cq should have updated tail
+
+    // TODO: check for any overflows
+    vlog("cqe->res=", cqe->res);
+    struct io_uring_zcrx_cqe* rcqe;
+    rcqe = (struct io_uring_zcrx_cqe*)(cqe + 1);
+    auto res = zcPool_->consume(cqe, rcqe);
+    addSend(sock, res.to_write);
+    zcPool_->recycle(cqe, rcqe);
+
+    vlog("----- processRecvZc: sync");
+    zcPool_->sync();
+  }
+
   void processCqe(struct io_uring_cqe* cqe, unsigned int& reads) {
     switch (get_tag(cqe->user_data)) {
       case kAccept:
@@ -1293,7 +1547,11 @@ struct IOUringRunner : public RunnerBase {
         ++reads;
         processRead(cqe);
         break;
+      case kRecvZc:
+        processRecvZc(cqe);
+        break;
       case kWrite:
+        vlog("----- processWrite -----");
         // be careful if you do something here as kRead might delete sockets.
         // this is ok as we only ever have one read outstanding
         // at once
@@ -1312,6 +1570,13 @@ struct IOUringRunner : public RunnerBase {
         }
         break;
       case kOther:
+        vlog(
+            "processOther: res=",
+            cqe->res,
+            ", flags=",
+            cqe->flags,
+            ", user_data=",
+            cqe->user_data);
         if (cqe->user_data) {
           TSock* sock = untag<TSock>(cqe->user_data);
           if (sock->closing()) {
@@ -1347,9 +1612,11 @@ struct IOUringRunner : public RunnerBase {
   }
 
   int submitAndWait1(struct io_uring_cqe** cqe, struct __kernel_timespec* ts) {
+    vlog("submitting...");
     int got = checkedErrno(
         io_uring_submit_and_wait_timeout(&ring, cqe, 1, ts, NULL),
         "submit_and_wait_timeout");
+    vlog("submitted=", got);
     if (got >= 0) {
       // io_uring_submit_and_wait_timeout actually returns 0
       expected = 0;
@@ -1368,6 +1635,7 @@ struct IOUringRunner : public RunnerBase {
 
   // todo: replace with io_uring_flush_overflow when it lands
   int flushOverflow() const {
+    vlog("start");
     int flags = IORING_ENTER_GETEVENTS;
     if (rxCfg_.register_ring) {
       flags |= IORING_ENTER_REGISTERED_RING;
@@ -1376,8 +1644,7 @@ struct IOUringRunner : public RunnerBase {
         ring.enter_ring_fd, 0, 0, flags, NULL, _NSIG / 8);
   }
 
-  void start() override {
-  }
+  void start() override {}
 
   void loop(std::atomic<bool>* should_shutdown) override {
     RxStats rx_stats{name(), cfg_.print_read_stats};
@@ -1386,6 +1653,7 @@ struct IOUringRunner : public RunnerBase {
     timeout.tv_nsec = 0;
 
     if (rxCfg_.register_ring) {
+      io_uring_enable_rings(&ring);
       io_uring_register_ring_fd(&ring);
     }
 
@@ -1402,8 +1670,8 @@ struct IOUringRunner : public RunnerBase {
         rx_stats.doneWait();
       } else if (expected) {
         submitAndWait1(&cqe, &timeout);
-        rx_stats.doneWait();
         // cqe might not be set here if we submitted
+        rx_stats.doneWait();
       } else {
         int wait_res = checkedErrno(
             io_uring_wait_cqe_timeout(&ring, &cqe, &timeout),
@@ -1413,6 +1681,7 @@ struct IOUringRunner : public RunnerBase {
 
         // can trust here that cqe will be set
         if (!wait_res && cqe) {
+          vlog("!wait_res && cqe, processing");
           processCqe(cqe, reads);
           io_uring_cqe_seen(&ring, cqe);
         }
@@ -1431,10 +1700,11 @@ struct IOUringRunner : public RunnerBase {
       }
 
       int cqe_count = 0;
-      unsigned int head;
-      io_uring_for_each_cqe(&ring, head, cqe) {
-        processCqe(cqe, reads);
-        cqe_count++;
+      assert(ring.flags | IORING_SETUP_CQE32);
+      struct io_uring_cqe* cqes[32];
+      cqe_count = io_uring_peek_batch_cqe(&ring, &cqes[0], 32);
+      for (int i = 0; i < cqe_count; i++) {
+        processCqe(cqes[i], reads);
       }
       io_uring_cq_advance(&ring, cqe_count);
 
@@ -1488,7 +1758,11 @@ struct IOUringRunner : public RunnerBase {
   }
 
   bool isFixedFiles() const {
-    return rxCfg_.fixed_files;
+    return rxCfg_.fixed_files && !rxCfg_.use_zc;
+  }
+
+  bool isZeroCopy() const {
+    return rxCfg_.use_zc;
   }
 
   Config cfg_;
@@ -1498,6 +1772,7 @@ struct IOUringRunner : public RunnerBase {
   struct io_uring ring;
 
   typename TSock::TBufferProvider buffers_;
+  std::optional<ZCPoolProvider> zcPool_;
   std::vector<std::unique_ptr<ListenSock>> listenSocks_;
   std::vector<unsigned char> sendBuff_;
   int listeners_ = 0;
@@ -2034,6 +2309,15 @@ io_uring_desc.add_options()
      ->default_value(io_uring_cfg.provided_buffer_compact))
   ("defer_taskrun", po::value(&io_uring_cfg.defer_taskrun)
      ->default_value(io_uring_cfg.defer_taskrun))
+  ("use_zc", po::value(&io_uring_cfg.use_zc)
+     ->default_value(io_uring_cfg.use_zc))
+  ("zc_pool_pages", po::value(&io_uring_cfg.zc_pool_pages)
+     ->default_value(io_uring_cfg.zc_pool_pages))
+  ("zc_pool_page_size", po::value(&io_uring_cfg.zc_pool_page_size)
+     ->default_value(io_uring_cfg.zc_pool_page_size))
+  ("zc_queue_id", po::value(&io_uring_cfg.zc_queue_id)
+     ->default_value(io_uring_cfg.zc_queue_id))
+  ("zc_ifname", po::value(&io_uring_cfg.zc_ifname))
   ;
 
 epoll_desc.add_options()
@@ -2055,6 +2339,13 @@ epoll_desc.add_options()
   };
 
   simpleParse(*used_desc, splits);
+  if (io_uring_cfg.use_zc) {
+    auto ifidx = if_nametoindex(io_uring_cfg.zc_ifname.c_str());
+    if (!ifidx) {
+      die("bad interface name ", io_uring_cfg.zc_ifname);
+    }
+    io_uring_cfg.zc_ifindex = ifidx;
+  }
 
   if (io_uring_cfg.provided_buffer_low_watermark < 0) {
     // default to quarter unless explicitly told

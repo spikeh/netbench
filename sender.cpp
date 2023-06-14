@@ -1250,8 +1250,10 @@ class EpollSender : public ISender {
       conn->toSendAt = buff.data();
       conn->toSend = buff.size();
     }
+    vlog("fd=", conn->fd, ": sending ", conn->toSend, " bytes");
     do {
       int ret = ::send(conn->fd, conn->toSendAt, conn->toSend, MSG_NOSIGNAL);
+      vlog("fd=", conn->fd, ": sent ", ret, " bytes");
       if (ret >= 0) {
         if (ret >= conn->toSend) {
           break;
@@ -1287,8 +1289,10 @@ class EpollSender : public ISender {
       return false;
     }
     int e;
+    vlog("fd=", conn->fd, ": expecting ", conn->toRecv, " bytes");
     do {
       int ret = ::recv(conn->fd, rxbuff.data(), rxbuff.size(), 0);
+      vlog("fd=", conn->fd, ": received ", ret, " bytes");
       if (ret > 0) {
         if ((size_t)ret > conn->toRecv) {
           die("too much data, wanted only ", conn->toRecv, " got ", ret);
@@ -1305,6 +1309,12 @@ class EpollSender : public ISender {
         log("connection ", i, " closed");
       } else {
         e = errno;
+        log("doRead ",
+            conn->fd,
+            ": recv() error, errno=",
+            e,
+            ", error=",
+            strerror(e));
         if (e == EAGAIN) {
           return false;
         }
@@ -1322,24 +1332,30 @@ class EpollSender : public ISender {
     end_ = TClock::now() +
         std::chrono::milliseconds(
                static_cast<uint64_t>(cfg_.run_seconds * 1000.0));
+    vlog("initial send");
     for (unsigned int i = 0; i < connections_.size(); i++) {
       doSend(i, false);
     }
     std::array<struct epoll_event, 1024> epoll_events;
+    vlog("starting epoll_wait loop");
     while (TClock::now() < end_) {
       int nevents = checkedErrno(
           epoll_wait(epollFd_, epoll_events.data(), epoll_events.size(), 100),
           "epoll_wait");
+      vlog("----- epoll_wait, nevents=", nevents);
       for (int i = 0; i < nevents; i++) {
+        int connIdx = epoll_events[i].data.u32;
         if (epoll_events[i].events & EPOLLIN) {
-          if (doRead(i)) {
+          if (doRead(connIdx)) {
             if (perCfg_.workload) {
               runWorkload(1, perCfg_.workload);
             }
-            doSend(i, false);
+            doSend(connIdx, false);
+          } else {
+            // i failed!
           }
         } else if (epoll_events[i].events & EPOLLOUT) {
-          doSend(i, true);
+          doSend(connIdx, true);
         }
       }
     }

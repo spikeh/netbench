@@ -78,10 +78,10 @@ struct SendResults {
   std::string toString() const {
     return strcat(
         "packetsPerSecond=",
-        leftpad(strcat((int)(packetsPerSecond / 1000)), 7),
-        "k bytesPerSecond=",
-        leftpad(strcat((int)(bytesPerSecond / 1000000)), 5),
-        "M connectErrors=",
+        packetsPerSecond,
+        " bytesPerSecond=",
+        leftpad(strcat((int)(bytesPerSecond / 1000)), 5),
+        "k connectErrors=",
         connectErrors,
         " sendErrors=",
         sendErrors,
