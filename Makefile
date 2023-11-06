@@ -1,6 +1,6 @@
 HEADERS = $(wildcard *.h)
 CXX = g++
-CXXFLAGS ?=  -g -O2 -std=c++2a -Wall
+CXXFLAGS ?=  -g -O2 -std=c++20 -Wall
 LDFLAGS ?= $(LDFLAGS_EXTRA) -g -O2 -std=c++2a -lpthread
 SRCS = $(wildcard *.cpp)
 OBJECTS = $(patsubst %.cpp, %.o, $(SRCS))
