@@ -1,3 +1,4 @@
 [submodule "liburing"]
 	path = liburing
-	url = https://github.com/axboe/liburing.git
+	url = https://github.com/spikeh/liburing.git
+	branch = zcrx/next
