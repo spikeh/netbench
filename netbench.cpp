@@ -1,6 +1,7 @@
 #include <boost/algorithm/string/join.hpp>
 #include <boost/align/aligned_allocator.hpp>
 #include <boost/core/noncopyable.hpp>
+#include <boost/crc.hpp>
 #include <numeric>
 #include <string_view>
 #include <thread>
@@ -944,6 +945,9 @@ class ZCPoolProvider : private boost::noncopyable {
     uint64_t off = rcqe->off & mask;
     void* addr = (char*)poolBase_ + off;
     auto consumed = parser_.consume((const char*)addr, cqe->res);
+    boost::crc_32_type checksum;
+    checksum.process_bytes((const char*)addr, cqe->res);
+    log("crc32: ", checksum.checksum());
     vlog(
         "size=",
         cqe->res,

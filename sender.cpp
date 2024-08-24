@@ -1,9 +1,11 @@
 #include "sender.h"
+#include <boost/crc.hpp>
 #include <boost/program_options.hpp>
 #include <boost/thread/barrier.hpp>
 #include <algorithm>
 #include <deque>
 #include <numeric>
+#include <random>
 #include <thread>
 
 #include <arpa/inet.h>
@@ -1162,10 +1164,21 @@ struct EpollConnection {
   std::vector<std::chrono::microseconds> latencies;
 };
 
+void generateData(std::vector<char>& buff) {
+  std::random_device rd; // Obtain a random number from hardware
+  std::mt19937 gen(rd()); // Seed the generator
+  std::uniform_int_distribution<> distrib(0, 255); // Define the range
+
+  for (size_t i = 0; i < buff.size(); i++) {
+    buff[i] = static_cast<char>(distrib(gen));
+  }
+}
+
 class EpollSender : public ISender {
  public:
   std::vector<char> buff;
   std::vector<char> rxbuff;
+  boost::crc_32_type checksum;
   EpollSender(
       GlobalSendOptions const& options,
       PerSendOptions const& per_opts,
@@ -1179,11 +1192,14 @@ class EpollSender : public ISender {
 
     // prep buffer
     buff.resize(sizeof(uint32_t) * 2 + size);
+    generateData(buff);
     rxbuff.resize(std::min<size_t>(1024, per_opts.resp));
     std::array<uint32_t, 2> lens;
     lens[0] = size;
     lens[1] = perCfg_.resp;
     memcpy(buff.data(), lens.data(), sizeof(lens));
+    checksum.process_bytes(buff.data(), buff.size());
+    log("crc32: ", checksum.checksum());
   }
 
   ~EpollSender() {
