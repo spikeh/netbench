@@ -272,6 +272,7 @@ void runWorkload(RxConfig const& cfg, uint32_t consumed) {
 struct ConsumeResults {
   size_t to_write = 0;
   uint32_t count = 0;
+  uint32_t crc32 = 0;
 
   ConsumeResults& operator+=(ConsumeResults const& rhs) {
     to_write += rhs.to_write;
@@ -948,6 +949,7 @@ class ZCPoolProvider : private boost::noncopyable {
     boost::crc_32_type checksum;
     checksum.process_bytes((const char*)addr, cqe->res);
     log("crc32: ", checksum.checksum());
+    consumed.crc32 = checksum.checksum();
     vlog(
         "size=",
         cqe->res,
@@ -1355,6 +1357,17 @@ struct IOUringRunner : public RunnerBase {
     io_uring_sqe_set_data(sqe, tag(sock, kWrite));
   }
 
+  void addSend(TSock* sock, ConsumeResults res) {
+    auto len = res.to_write;
+    if (unlikely(sendBuff_.size() < len)) {
+      sendBuff_.resize(len);
+    }
+    memcpy(sendBuff_.data(), &res.crc32, sizeof(res.crc32));
+    struct io_uring_sqe* sqe = get_sqe();
+    sock->addSend(sqe, sendBuff_.data(), len);
+    io_uring_sqe_set_data(sqe, tag(sock, kWrite));
+  }
+
   void processAccept(struct io_uring_cqe* cqe) {
     int fd = cqe->res;
     vlog("start");
@@ -1535,7 +1548,7 @@ struct IOUringRunner : public RunnerBase {
     struct io_uring_zcrx_cqe* rcqe;
     rcqe = (struct io_uring_zcrx_cqe*)(cqe + 1);
     auto res = zcPool_->consume(cqe, rcqe);
-    addSend(sock, res.to_write);
+    addSend(sock, res);
     zcPool_->recycle(cqe, rcqe);
 
     vlog("----- processRecvZc: sync");

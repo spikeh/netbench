@@ -1314,6 +1314,11 @@ class EpollSender : public ISender {
           die("too much data, wanted only ", conn->toRecv, " got ", ret);
         } else if ((size_t)ret == conn->toRecv) {
           conn->toRecv = 0;
+          uint32_t crc32;
+          memcpy(&crc32, rxbuff.data(), sizeof(crc32));
+          if (checksum.checksum() != crc32) {
+            die("incorrect checksum");
+          }
           latencies_.push_back(conn->recv(TClock::now()));
           return true;
         } else {
