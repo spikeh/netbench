@@ -277,6 +277,12 @@ struct ConsumeResults {
   ConsumeResults& operator+=(ConsumeResults const& rhs) {
     to_write += rhs.to_write;
     count += rhs.count;
+    if (rhs.crc32 > 0) {
+      if (crc32 > 0) {
+        die("got two checksums in same read");
+      }
+      crc32 = rhs.crc32;
+    }
     return *this;
   }
 };
@@ -292,26 +298,64 @@ struct ProtocolParser {
       so_far += n;
       if (!is_reading[0]) {
         if (likely(n >= sizeof(is_reading) && size_buff_have == 0)) {
-          size_buff_have = sizeof(is_reading);
+          size_buff_have = sizeof(is_reading); // 8
           memcpy(&is_reading, data, sizeof(is_reading));
+          frame_size = is_reading[0] + sizeof(is_reading);
+          rxbuff.resize(frame_size);
         } else {
           uint32_t size_buff_add =
-              std::min<uint32_t>(n, sizeof(is_reading) - size_buff_have);
+              std::min<uint32_t>(n, sizeof(is_reading) - size_buff_have); // 0?
           memcpy(size_buff + size_buff_have, data, size_buff_add);
           size_buff_have += size_buff_add;
           if (size_buff_have >= sizeof(is_reading)) {
             memcpy(&is_reading, size_buff, sizeof(is_reading));
+            frame_size = is_reading[0] + sizeof(is_reading);
+            rxbuff.resize(frame_size);
           }
         }
       }
-      if (is_reading[0] && so_far >= is_reading[0] + sizeof(is_reading)) {
-        data += n;
-        n = so_far - (is_reading[0] + sizeof(is_reading));
+      vlog(
+          "so_far=",
+          so_far,
+          ", frame_size=",
+          frame_size,
+          ", rxbuff_so_far=",
+          rxbuff_so_far);
+      if (is_reading[0] && so_far >= frame_size) {
+        boost::crc_32_type crc32;
+        auto remaining_bytes = frame_size - rxbuff_so_far;
+        if (rxbuff_so_far == 0) {
+          crc32.process_bytes(data, frame_size);
+        } else {
+          memcpy(rxbuff.data() + rxbuff_so_far, data, remaining_bytes);
+          crc32.process_bytes(rxbuff.data(), rxbuff.size());
+        }
+
+        if (remaining_bytes) {
+          data += so_far - frame_size;
+        }
+        n = so_far - frame_size;
+
         ret.to_write += is_reading[1];
         ret.count++;
-        so_far = size_buff_have = 0;
+
+        ret.crc32 = crc32.checksum();
+        vlog("----- crc32=", crc32.checksum());
+
+        size_buff_have = 0;
         memset(&is_reading, 0, sizeof(is_reading));
+        so_far = 0;
+        frame_size = 0;
+        rxbuff_so_far = 0;
+        rxbuff.clear();
       } else {
+        vlog(
+            "copying partial frame, size=",
+            n,
+            ", rxbuff_so_far=",
+            rxbuff_so_far);
+        memcpy(rxbuff.data() + rxbuff_so_far, data, n);
+        rxbuff_so_far += n;
         break;
       }
     }
@@ -322,6 +366,10 @@ struct ProtocolParser {
   std::array<uint32_t, 2> is_reading = {{0}};
   char size_buff[sizeof(is_reading)];
   uint32_t so_far = 0;
+  uint32_t frame_size = 0;
+
+  uint32_t rxbuff_so_far = 0;
+  std::vector<char> rxbuff;
 };
 
 class RxStats {
@@ -937,6 +985,11 @@ class ZCPoolProvider : private boost::noncopyable {
     IO_URING_WRITE_ONCE(*rqRing_.ktail, rqRing_.rq_tail);
   }
 
+  char const* getData(uint64_t off) {
+    uint64_t mask = (1ULL << IORING_ZCRX_AREA_SHIFT) - 1;
+    return (char*)poolBase_ + (off & mask);
+  }
+
  private:
  public:
   ConsumeResults consume(
@@ -1167,6 +1220,19 @@ struct BasicSock {
       didRead(buff, res);
       return DidReadResult(res, -1);
     }
+  }
+
+  DidReadResult didReadZc(
+      ZCPoolProvider& provider,
+      struct io_uring_cqe* cqe,
+      struct io_uring_zcrx_cqe* rcqe) {
+    int res = cqe->res;
+    auto* data = provider.getData(rcqe->off);
+    if (!data) {
+      die("bad zc rx data");
+    }
+    didRead(data, res);
+    return DidReadResult(res, 0);
   }
 
  private:
@@ -1547,10 +1613,17 @@ struct IOUringRunner : public RunnerBase {
     vlog("cqe->res=", cqe->res);
     struct io_uring_zcrx_cqe* rcqe;
     rcqe = (struct io_uring_zcrx_cqe*)(cqe + 1);
-    auto res = zcPool_->consume(cqe, rcqe);
-    addSend(sock, res);
-    zcPool_->recycle(cqe, rcqe);
 
+    auto res = sock->didReadZc(zcPool_.value(), cqe, rcqe);
+    if (auto const& sends = sock->peekSend(); sends.to_write > 0) {
+      finishedRequests(sends.count);
+
+      addSend(sock, sends);
+      sock->didSend();
+    }
+    didRead(res.amount);
+
+    zcPool_->recycle(cqe, rcqe);
     vlog("----- processRecvZc: sync");
     zcPool_->sync();
   }
