@@ -1530,7 +1530,7 @@ struct IOUringRunner : public RunnerBase {
     if (res.amount > 0) {
       if (auto const& sends = sock->peekSend(); sends.to_write > 0) {
         finishedRequests(sends.count);
-        addSend(sock, sends.to_write);
+        addSend(sock, sends);
         sock->didSend();
       }
       didRead(res.amount);
